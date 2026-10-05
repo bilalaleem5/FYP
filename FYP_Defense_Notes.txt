@@ -1,0 +1,368 @@
+================================================================================
+         VehicleWalay — FYP DEFENSE NOTES  (March 2026)
+         Student: Bilal | Roll: i221866 | NUCES
+================================================================================
+
+PROJECT TITLE:
+  VehicleWalay — AI-Powered Vehicle Discovery Platform
+  (Aggregates & enriches Pakistan's car listings from PakWheels)
+
+================================================================================
+1. PROJECT KYA HAI? (What is VehicleWalay?)
+================================================================================
+
+VehicleWalay ek AI-powered car marketplace hai jo:
+  - PakWheels.com se automatically lakhs gariyon ki listings scrape karta hai
+  - Data ko ek organized database mein store karta hai
+  - Users ko ek clean, fast, modern frontend pe browse karne deta hai
+  - Users apni favourite listings save kar sakte hain (bookmark)
+
+Main problem jo solve ki gayi:
+  - PakWheels ka data scattered hota hai aur unka apna UI old-fashioned hai
+  - Koi centralized, fast, searchable car data store nahi tha
+  - Scraping difficult thi kyunki PakWheels sirf 100 pages dikhata hai per search
+
+================================================================================
+2. TECH STACK (Technologies Used)
+================================================================================
+
+  FRONTEND:   Next.js 15 (React) + Tailwind CSS
+  BACKEND:    Python + FastAPI
+  DATABASE:   PostgreSQL 15
+  SCRAPER:    Python aiohttp (Async) + BeautifulSoup4
+  ORM:        SQLAlchemy
+  DOCKER:     Docker Compose (PostgreSQL container)
+  SERVER:     Uvicorn (ASGI server for FastAPI)
+
+================================================================================
+3. ARCHITECTURE OVERVIEW (Kaise kaam karta hai?)
+================================================================================
+
+  [PakWheels.com]
+       |
+       | (HTTP Requests — Async Scraper)
+       v
+  [Scraper — async_scraper.py]
+       |
+       | (SQLAlchemy ORM)
+       v
+  [PostgreSQL Database — Docker Container]
+       |
+       | (REST API — FastAPI)
+       v
+  [Backend — FastAPI on port 8000]
+       |
+       | (HTTP JSON — fetch API)
+       v
+  [Frontend — Next.js on port 3000]
+       |
+       v
+  [User's Browser]
+
+================================================================================
+4. DOCKER — KYA KAAM KARTA HAI?
+================================================================================
+
+Docker sirf DATABASE ke liye use ho raha hai.
+
+  File:  docker-compose.yml
+
+  Services:
+    - db (PostgreSQL 15)
+        container_name : vehiclewalay_postgres
+        Port           : 5434 (host) → 5432 (container)
+        Database name  : vehiclewalay
+        Username       : postgres
+        Password       : adminpassword
+        Volume         : postgres_data (persistent storage)
+
+  Command to start:
+    docker-compose up -d
+
+  Kyun Docker?
+    - PostgreSQL ko manually install karne ki zaroorat nahi
+    - Data persistent rahta hai container restart ke baad bhi (volumes)
+    - Alag alag machines pe same environment milta hai
+    - Production-ready setup
+
+  .env file mein connection:
+    DATABASE_URL = postgresql://postgres:adminpassword@127.0.0.1:5434/vehiclewalay
+
+================================================================================
+5. DATABASE ARCHITECTURE (4 Tables)
+================================================================================
+
+Table 1: vehicles
+  → Har scraped car ki complete information
+  Columns:
+    id              - Auto-increment primary key
+    title           - "Toyota Corolla 2020 Automatic"
+    price           - Float (e.g. 3500000)
+    currency        - "PKR"
+    make            - "Toyota"
+    model           - "Corolla"
+    model_year      - 2020
+    mileage         - 45000 (km)
+    transmission    - "Automatic" / "Manual"
+    fuel_type       - "Petrol" / "Diesel" / "Hybrid"
+    engine_capacity - 1300 (cc)
+    color           - "White"
+    assembly        - "Local" / "Imported"
+    body_type       - "Sedan" / "Hatchback" / "SUV" etc.
+    registered_city - "Karachi"
+    location        - "North Nazimabad, Karachi"
+    image_url       - Main thumbnail URL
+    extra_images    - JSON array of all gallery image URLs
+    description     - Seller's comments/note
+    features        - JSON array ["ABS", "Airbags", "Alloy Rims" ...]
+    owner_name      - Seller's name
+    owner_contact   - Phone number
+    source_url      - Original PakWheels URL (UNIQUE)
+    created_at      - Timestamp
+
+Table 2: scraped_urls
+  → Scraper ka queue system (stateful tracking)
+  Columns:
+    id           - Primary key
+    url          - PakWheels listing URL (UNIQUE)
+    status       - PENDING / SCRAPED / FAILED (Enum)
+    shallow_data - JSON (basic data from search page)
+    last_attempt - When it was last tried
+
+Table 3: users
+  → Registered users
+  Columns:
+    id, email (UNIQUE), name, created_at
+
+Table 4: saved_vehicles
+  → User ki bookmarked/saved listings
+  Columns:
+    id, user_id (FK→users), vehicle_id (FK→vehicles), created_at
+
+Table 5: saved_searches
+  → User ke saved search queries
+  Columns:
+    id, user_id, name ("Civic in Lahore"), query, created_at
+
+================================================================================
+6. BACKEND — FASTAPI (How it works)
+================================================================================
+
+  File: backend/main.py
+  Run command: uvicorn main:app --reload
+
+  PORT: 8000
+
+  Features:
+    - CORS enabled (allows frontend at localhost:3000)
+    - Auto table creation on startup (SQLAlchemy)
+    - 3 main route groups (routers):
+
+  API Endpoints:
+
+  /api/listings       (listings.py)
+    GET  /api/listings            → All listings (with filters: make, city, year, etc.)
+    GET  /api/listings/{id}       → Single vehicle detail
+
+  /api/users          (users.py)
+    POST /api/users               → Register/create user
+
+  /api/saved-vehicles (saved.py)
+    GET  /api/saved-vehicles/{user_id}         → Get user's saved vehicles
+    POST /api/saved-vehicles/{user_id}/{vehicle_id} → Save a vehicle
+    DELETE /api/saved-vehicles/{user_id}/{vehicle_id} → Remove saved vehicle
+
+  Database Connection (database.py):
+    - Uses SQLAlchemy create_engine with DATABASE_URL from .env
+    - SessionLocal factory for DB sessions
+    - get_db() dependency injection for routes
+
+================================================================================
+7. SCRAPER — HOW IT WORKS (Most Important Part)
+================================================================================
+
+  File: backend/scraper/async_scraper.py
+
+  PROBLEM SOLVED:
+    PakWheels sirf 100 pages dikhata hai per search URL.
+    100 pages × 24 listings = sirf 2400 listings per URL.
+    Total listings on PakWheels: 5 lakh+ (500,000+)
+
+  SOLUTION — MATRIX STRATEGY:
+    URL ko break down karo: City × Make × Year
+    e.g.:
+      /used-cars/toyota/lahore/?year_from=2020&year_to=2020
+      /used-cars/toyota/karachi/?year_from=2021&year_to=2021
+      /used-cars/honda/rawalpindi/?year_from=2019&year_to=2019
+
+    For Toyota/Suzuki/Honda (MASSIVE_MAKES): City × Make × Year (1990-2026)
+    For other brands:                        City × Make
+    Fallback:                                Make only (no city)
+    Catch-all:                               /used-cars/search/-/
+
+    Total URLs generated: ~13,800+ unique search URLs
+
+  PHASE 1 — DISCOVERY:
+    1. Generate 13,800 search URLs
+    2. Visit each URL page by page (up to 100 pages each)
+    3. Extract listing URLs + basic info (shallow data)
+    4. Save to scraped_urls table with status = PENDING
+    5. Async: 5 concurrent requests at a time (polite crawling)
+
+  PHASE 2 — EXTRACTION:
+    1. Read PENDING URLs from DB in batches of 500
+    2. Visit each listing's detail page
+    3. Extract deep data:
+       - Seller's actual comments (#scroll_seller_note)
+       - Car features list (#scroll_features)
+       - Gallery images (all photos)
+       - Granular location ("North Nazimabad, Karachi")
+       - Specs: Color, Assembly, Body Type, Engine CC, Registered City
+       - Seller name & phone (via API call if logged in)
+    4. Merge shallow + deep data
+    5. Save to vehicles table
+    6. Mark URL as SCRAPED
+
+  BUGS FIXED IN SCRAPER:
+    - Body Type showed "Vehicle" → Fixed with index-based label/value parsing
+    - Location showed only "Karachi" → Now overrides with granular detail page location
+    - Seller comments showed specs → Now uses correct CSS selector #scroll_seller_note
+    - PakWheels boilerplate text → Stripped automatically
+    - Features from wrong section → Now uses #scroll_features selector
+    - Page URL conflict (?page= on URLs with ? already) → Fixed with _build_paginated_url()
+    - Duplicate URLs → Using Python set() deduplication
+    - Slow DB inserts → Using bulk_save_objects()
+    - Windows emoji crash in logs → UTF-8 safe logging with console handler
+
+  ASYNC ARCHITECTURE:
+    - Uses Python asyncio + aiohttp (non-blocking HTTP)
+    - 5 concurrent requests (CONCURRENT_REQUESTS = 5)
+    - 1.0 second delay between requests (polite, avoids ban)
+    - 3 retry attempts per URL with exponential backoff
+    - Rate limit (429) → waits 15s before retrying
+    - Stateful: if scraper crashes, it resumes from PENDING URLs
+
+================================================================================
+8. FRONTEND — NEXT.JS (User Interface)
+================================================================================
+
+  Run command: npm run dev  (port 3000)
+  Framework: Next.js 15 + Tailwind CSS
+
+  Pages:
+    /              → Homepage (Featured listings, Search bar, Browse by Make/City)
+    /search        → Search results with filters
+    /vehicle/[id]  → Vehicle detail page
+    /saved         → User's saved/bookmarked vehicles
+
+  Key Components:
+    - Navbar          → With VehicleWalay logo, navigation links, Login button
+    - ListingCard     → Car card with image, title, price, specs
+    - ImageGallery    → Interactive photo gallery on detail page
+    - SaveVehicleButton → Heart button to bookmark a listing
+
+  Detail Page Shows:
+    - Full image gallery
+    - Core specs: Year, Mileage, Fuel Type, Transmission
+    - Secondary specs: Location (full area), Assembly, Body Type, Registered In
+    - Car Features list (ABS, Airbags, etc.)
+    - Seller's Comments
+    - Seller Details widget (Name, Phone, Contact button)
+    - Safety tips for buyer
+
+  Data Flow:
+    Frontend → fetch() → FastAPI → SQLAlchemy → PostgreSQL → JSON response
+
+================================================================================
+9. HOW TO RUN THE WHOLE PROJECT
+================================================================================
+
+  Step 1: Start Database (Docker)
+    docker-compose up -d
+
+  Step 2: Start Backend (FastAPI)
+    cd d:\fyp\backend
+    venv\Scripts\activate
+    uvicorn main:app --reload
+    → Opens at http://localhost:8000
+    → API docs at http://localhost:8000/docs
+
+  Step 3: Start Frontend (Next.js)
+    cd d:\fyp\frontend
+    npm run dev
+    → Opens at http://localhost:3000
+
+  Step 4: Run Scraper (Separate terminal)
+    cd d:\fyp\backend
+    venv\Scripts\activate
+    python scraper/async_scraper.py
+
+  Step 5: Check DB Stats
+    cd d:\fyp\backend
+    python check_db_stats.py
+
+================================================================================
+10. COMMON TEACHER QUESTIONS & ANSWERS
+================================================================================
+
+Q: Why did you use FastAPI instead of Django?
+A: FastAPI is faster, modern, and automatically generates API documentation
+   at /docs. It uses async/await natively which fits our async scraper.
+   Django is heavier and more suited for full-stack MVC apps.
+
+Q: Why PostgreSQL and not MySQL or SQLite?
+A: PostgreSQL supports JSON column type natively (for features & images arrays),
+   has better performance for large datasets (lakhs of records), and is
+   industry-standard for production applications.
+
+Q: Why Docker?
+A: Docker ensures the database environment is identical on any machine.
+   No manual PostgreSQL installation needed. Data persists via volumes.
+   One command (docker-compose up -d) starts everything.
+
+Q: How do you handle PakWheels 100-page limit?
+A: We generate a matrix of URLs by combining City × Make × Year.
+   Each URL combination gets its own 100-page limit, giving us ~13,800
+   unique search endpoints. This gives us coverage of millions of potential
+   listing slots across all of Pakistan.
+
+Q: How is scraping ethical/legal?
+A: We only scrape publicly available data. We add delays (1 second between
+   requests) to avoid overloading their server. We identify ourselves with
+   a standard browser User-Agent.
+
+Q: What if PakWheels changes their HTML?
+A: We have multiple fallback CSS selectors for each field. The scraper
+   tries 3-4 different selectors before giving up. Additionally, shallow
+   data from search pages acts as a backup for detail page failures.
+
+Q: How does the Save/Bookmark feature work?
+A: User clicks the heart icon → POST /api/saved-vehicles/{user_id}/{vehicle_id}
+   → SavedVehicle record created in DB → GET /api/saved-vehicles/{user_id}
+   returns all saved vehicles with full vehicle details (JOIN query).
+
+Q: Is this production-ready?
+A: The architecture is production-ready (PostgreSQL, FastAPI, Next.js).
+   For full production, we would add: user authentication (JWT), search
+   indexing (Elasticsearch), CDN for images, and cloud hosting (AWS/GCP).
+
+Q: How many listings can you store?
+A: PostgreSQL can handle hundreds of millions of rows. Our current schema
+   is optimized with indexes on: source_url, make, model, location, model_year.
+
+================================================================================
+11. PROJECT STATS (Approximate)
+================================================================================
+
+  Matrix URLs Generated:    ~13,800+
+  Cities Covered:           50+ (All provinces of Pakistan)
+  Car Makes Covered:        70+ (Toyota, Honda, Suzuki + premium brands)
+  Year Range:               1990 – 2026
+  DB Tables:                5
+  API Endpoints:            7+
+  Frontend Pages:           4
+  Scraper Phases:           2 (Discovery + Extraction)
+
+================================================================================
+                     END OF DEFENSE NOTES
+================================================================================

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# DB and Vector Index
+*.db
+*.sqlite3
+*.faiss
+
+# Secrets
+.env
+.env.local
+
+# Temp and Logs
+*.log
+backend/uploads/
+backend/logs/
+*.html
+
+# OS
+.DS_Store
+Thumbs.db
