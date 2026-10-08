@@ -8,8 +8,11 @@ from sqlalchemy.orm import Session
 from database import get_db
 import models
 import os
-
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-fyp-key-12345")
+# JWT Secret Configuration
+SECRET_KEY = os.getenv(
+    "JWT_SECRET_KEY", 
+    "vw_sec_key_e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+)
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 7 days
 

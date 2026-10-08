@@ -50,6 +50,11 @@ def format_vehicle_for_embedding(vehicle) -> str:
     # Remove excessive whitespace/newlines
     return " ".join(text.split())
 
+import threading
+
+_index_lock = threading.Lock()
+_cached_index = None
+
 def init_index():
     """Initializes a new FAISS index with ID mapping."""
     # IndexFlatL2 is good for exact search. We wrap it in IndexIDMap to store our DB IDs.
@@ -96,38 +101,36 @@ def build_index_from_db(db: Session):
     
     logger.info(f"Embeddings generated in {time.time() - start_time:.2f} seconds.")
     
-    # Build FAISS index
-    index = init_index()
-    index.add_with_ids(embeddings, id_array)
-    
-    # Save to disk
-    faiss.write_index(index, INDEX_FILE)
-    logger.info(f"FAISS index successfully saved to {INDEX_FILE} with {index.ntotal} vectors.")
+    # Build FAISS index under thread lock
+    global _cached_index
+    with _index_lock:
+        index = init_index()
+        index.add_with_ids(embeddings, id_array)
+        faiss.write_index(index, INDEX_FILE)
+        _cached_index = index
+        logger.info(f"FAISS index successfully saved to {INDEX_FILE} with {index.ntotal} vectors.")
 
-def load_index():
-    """Loads the FAISS index from disk."""
-    if os.path.exists(INDEX_FILE):
-        return faiss.read_index(INDEX_FILE)
-    return None
+def load_index(force_reload: bool = False):
+    """Thread-safe index loader with in-memory caching to prevent disk I/O bottlenecks."""
+    global _cached_index
+    with _index_lock:
+        if _cached_index is not None and not force_reload:
+            return _cached_index
+        if os.path.exists(INDEX_FILE):
+            try:
+                _cached_index = faiss.read_index(INDEX_FILE)
+                return _cached_index
+            except Exception as e:
+                logger.error(f"Error loading FAISS index: {e}")
+                return None
+        return None
 
 def update_vehicle_in_index(vehicle, index=None):
     """
-    Updates or inserts a single vehicle into the FAISS index.
-    Useful for when the scraper fetches a new vehicle, so we don't have to rebuild the whole index.
+    Updates or inserts a single vehicle into the FAISS index with thread safety.
     """
     if vehicle.spam_flagged:
         return # Do not index spam
-        
-    if index is None:
-        index = load_index()
-        if index is None:
-            index = init_index()
-            
-    # FAISS IndexIDMap doesn't easily support "update", we have to remove and add
-    try:
-        index.remove_ids(np.array([vehicle.id]).astype('int64'))
-    except Exception:
-        pass # It wasn't in the index yet
         
     text = format_vehicle_for_embedding(vehicle)
     model = get_model()
@@ -137,13 +140,26 @@ def update_vehicle_in_index(vehicle, index=None):
     embedding = model.encode([text])
     embedding = np.array(embedding).astype('float32')
     faiss.normalize_L2(embedding)
-    
-    index.add_with_ids(embedding, np.array([vehicle.id]).astype('int64'))
-    faiss.write_index(index, INDEX_FILE)
+
+    global _cached_index
+    with _index_lock:
+        if index is None:
+            index = _cached_index or load_index()
+            if index is None:
+                index = init_index()
+
+        try:
+            index.remove_ids(np.array([vehicle.id]).astype('int64'))
+        except Exception:
+            pass # It wasn't in the index yet
+
+        index.add_with_ids(embedding, np.array([vehicle.id]).astype('int64'))
+        faiss.write_index(index, INDEX_FILE)
+        _cached_index = index
 
 def search_vehicles(query: str, top_k: int = 10):
     """
-    Searches the FAISS index using natural language query.
+    Searches the FAISS index using natural language query under thread protection.
     Returns a list of vehicle IDs.
     """
     index = load_index()
@@ -160,8 +176,9 @@ def search_vehicles(query: str, top_k: int = 10):
     query_vector = np.array(query_vector).astype('float32')
     faiss.normalize_L2(query_vector)
     
-    # Perform search
-    distances, indices = index.search(query_vector, top_k)
+    # Thread-safe search execution
+    with _index_lock:
+        distances, indices = index.search(query_vector, top_k)
     
     # Convert numpy array to standard python list and filter out -1 (not found)
     results = [int(idx) for idx in indices[0] if idx != -1]

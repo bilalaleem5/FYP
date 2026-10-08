@@ -20,21 +20,59 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 def get_groq_client():
-    """Lazy-loads the Groq client."""
+    """Lazy-loads the Groq client (prefers AsyncGroq for non-blocking I/O)."""
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured in .env")
-    from groq import Groq
-    return Groq(api_key=GROQ_API_KEY)
+    try:
+        from groq import AsyncGroq
+        return AsyncGroq(api_key=GROQ_API_KEY)
+    except Exception:
+        from groq import Groq
+        return Groq(api_key=GROQ_API_KEY)
+
+async def call_groq_completion(client, **kwargs):
+    """Executes Groq completions without blocking the Uvicorn event loop."""
+    import inspect
+    import asyncio
+    res = client.chat.completions.create(**kwargs)
+    if inspect.isawaitable(res):
+        return await res
+    return await asyncio.to_thread(lambda: res)
+
+import re
+
+def sanitize_chat_query(query: str) -> str:
+    """
+    Sanitizes user input to mitigate prompt injection and control character exploits.
+    """
+    if not query:
+        return ""
+    # Strip null bytes and non-printable control chars
+    clean = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', str(query))
+    # Neutralize prompt injection markers (e.g. System:, [INST], <|im_start|>)
+    injection_patterns = [
+        r"(?i)\bignore\s+(all\s+)?(previous|prior)\s+instructions\b",
+        r"(?i)\bsystem\s*:",
+        r"(?i)\bdeveloper\s*mode\b",
+        r"(?i)<\|im_start\|>",
+        r"(?i)<\|im_end\|>",
+        r"(?i)\[INST\]",
+        r"(?i)\[/INST\]"
+    ]
+    for pattern in injection_patterns:
+        clean = re.sub(pattern, "[filtered]", clean)
+    return clean[:500].strip()
 
 
 # ─── Step 1: NLU — Extract structured intent from natural language ───
-def extract_intent(client, user_query: str, conversation_history: list = None) -> dict:
+async def extract_intent(client, user_query: str, conversation_history: list = None) -> dict:
     """
     Uses Groq LLM to parse a natural language query into structured JSON filters.
     Supports multi-turn conversation by accepting prior messages for context.
     Example: "mujhe 20 lakh mein Lahore ki Honda chahiye" ->
              {"make": "Honda", "city": "Lahore", "max_price": 2000000, "search_text": "Honda car in Lahore"}
     """
+    sanitized_query = sanitize_chat_query(user_query)
     system_prompt = """You are an expert AI assistant for a Pakistani used car marketplace called VehicleWalay.
 Your job is to extract structured search filters from the user's natural language query.
 
@@ -80,13 +118,14 @@ ONLY return valid JSON. No explanations, no markdown."""
         # Include up to last 6 turns for context (to stay within token limits)
         for turn in conversation_history[-6:]:
             role = turn.get("role", "user")
-            content = turn.get("content", "")
+            content = sanitize_chat_query(turn.get("content", ""))
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": user_query})
+    messages.append({"role": "user", "content": sanitized_query})
 
     try:
-        response = client.chat.completions.create(
+        response = await call_groq_completion(
+            client,
             model=GROQ_MODEL,
             messages=messages,
             temperature=0.1,
@@ -101,10 +140,10 @@ ONLY return valid JSON. No explanations, no markdown."""
         return json.loads(raw)
     except json.JSONDecodeError:
         logger.warning(f"Failed to parse LLM response as JSON: {raw}")
-        return {"search_text": user_query}
+        return {"search_text": sanitized_query}
     except Exception as e:
         logger.error(f"Groq NLU error: {e}")
-        return {"search_text": user_query}
+        return {"search_text": sanitized_query}
 
 
 # ─── Step 2: Hybrid Search — Combine FAISS + SQL filters ─────────
@@ -182,7 +221,8 @@ def hybrid_search(db: Session, intent: dict, top_k: int = 20) -> list:
 
 
 # ─── Step 3: Response Synthesis — Generate conversational reply ──
-def synthesize_response(client, user_query: str, vehicles: list, intent: dict, conversation_history: list = None) -> str:
+# ─── Step 3: Response Synthesis — Generate conversational reply ──
+async def synthesize_response(client, user_query: str, vehicles: list, intent: dict, conversation_history: list = None) -> str:
     """
     Takes the top vehicle results and generates a helpful, conversational response.
     Supports multi-turn conversation by including prior messages for context.
@@ -190,6 +230,8 @@ def synthesize_response(client, user_query: str, vehicles: list, intent: dict, c
     if not vehicles:
         return f"Sorry, no vehicles found matching \"{user_query}\". Please try adjusting your search terms or budget!"
     
+    sanitized_query = sanitize_chat_query(user_query)
+
     # Build a summary of top 5 vehicles for the LLM
     vehicle_summaries = []
     for i, v in enumerate(vehicles[:5], 1):
@@ -228,13 +270,14 @@ Rules:
     if conversation_history:
         for turn in conversation_history[-6:]:
             role = turn.get("role", "user")
-            content = turn.get("content", "")
+            content = sanitize_chat_query(turn.get("content", ""))
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": f"User query: {user_query}\n\nTop results:\n{vehicle_text}\n\nTotal matches found: {len(vehicles)}"})
+    messages.append({"role": "user", "content": f"User query: {sanitized_query}\n\nTop results:\n{vehicle_text}\n\nTotal matches found: {len(vehicles)}"})
 
     try:
-        response = client.chat.completions.create(
+        response = await call_groq_completion(
+            client,
             model=GROQ_MODEL,
             messages=messages,
             temperature=0.7,
@@ -300,7 +343,7 @@ def build_recommendation_history_line(user_query: str, intent: dict) -> str:
 
 # ─── Main Chat Endpoint ─────────────────────────────────────────
 @router.post("/chat")
-def ai_chat(
+async def ai_chat(
     payload: dict,
     db: Session = Depends(database.get_db),
 ):
@@ -336,7 +379,7 @@ def ai_chat(
     
     # Step 1: NLU — Extract intent (with conversation context)
     logger.info(f"🧠 NLU Processing: '{user_query}' (history: {len(conversation_history)} turns)")
-    intent = extract_intent(client, user_query, conversation_history)
+    intent = await extract_intent(client, user_query, conversation_history)
     logger.info(f"📋 Extracted Intent: {intent}")
     
     # Step 2: Hybrid Search — FAISS + SQL
@@ -344,7 +387,7 @@ def ai_chat(
     logger.info(f"🔍 Found {len(vehicles)} matching vehicles")
     
     # Step 3: Response Synthesis (with conversation context)
-    ai_response = synthesize_response(client, user_query, vehicles, intent, conversation_history)
+    ai_response = await synthesize_response(client, user_query, vehicles, intent, conversation_history)
     
     # Save rich history line so /recommendations FAISS profile matches chat intent (e.g. Prado)
     history_line = build_recommendation_history_line(user_query, intent)

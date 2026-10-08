@@ -59,26 +59,54 @@ def delete_saved_vehicle(saved_id: int, db: Session = Depends(database.get_db), 
 # --- Saved Searches (Alerts) ---
 
 @router.post("/saved-searches", response_model=schemas.SavedSearchResponse)
-def save_search(saved_search: schemas.SavedSearchCreate, db: Session = Depends(database.get_db)):
-    user = db.query(models.User).filter(models.User.id == saved_search.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-        
-    new_search = models.SavedSearch(**saved_search.model_dump())
+def save_search(
+    saved_search: schemas.SavedSearchCreate, 
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    # Enforce current user ID from verified JWT
+    search_data = saved_search.model_dump()
+    search_data['user_id'] = current_user.id
+    
+    new_search = models.SavedSearch(**search_data)
     db.add(new_search)
     db.commit()
     db.refresh(new_search)
     return new_search
 
+@router.get("/saved-searches", response_model=List[schemas.SavedSearchResponse])
+def get_my_saved_searches(
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    return db.query(models.SavedSearch).filter(
+        models.SavedSearch.user_id == current_user.id
+    ).order_by(models.SavedSearch.created_at.desc()).all()
+
 @router.get("/saved-searches/{user_id}", response_model=List[schemas.SavedSearchResponse])
-def get_saved_searches(user_id: int, db: Session = Depends(database.get_db)):
-    return db.query(models.SavedSearch).filter(models.SavedSearch.user_id == user_id).order_by(models.SavedSearch.created_at.desc()).all()
+def get_saved_searches(
+    user_id: int, 
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    if current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to access saved searches for another user")
+    return db.query(models.SavedSearch).filter(
+        models.SavedSearch.user_id == current_user.id
+    ).order_by(models.SavedSearch.created_at.desc()).all()
 
 @router.delete("/saved-searches/{search_id}")
-def delete_saved_search(search_id: int, db: Session = Depends(database.get_db)):
-    record = db.query(models.SavedSearch).filter(models.SavedSearch.id == search_id).first()
+def delete_saved_search(
+    search_id: int, 
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    record = db.query(models.SavedSearch).filter(
+        models.SavedSearch.id == search_id,
+        models.SavedSearch.user_id == current_user.id
+    ).first()
     if not record:
-        raise HTTPException(status_code=404, detail="Saved search not found")
+        raise HTTPException(status_code=404, detail="Saved search not found or unauthorized")
         
     db.delete(record)
     db.commit()
